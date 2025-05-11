@@ -7,9 +7,12 @@ import json
 import tempfile
 import shutil
 import sys
+import zipfile
+import io
+import datetime
 from typing import List, Dict, Any, Optional
 from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
@@ -56,11 +59,15 @@ app.add_middleware(
 
 # Create a temporary directory for storing uploaded files
 TEMP_DIR = Path("./temp")
-TEMP_DIR.mkdir(exist_ok=True)
+os.makedirs(TEMP_DIR, exist_ok=True)
 
 # Create a directory for storing extracted tables
 OUTPUT_DIR = Path("./output")
-OUTPUT_DIR.mkdir(exist_ok=True)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# Create a directory for storing ZIP archives
+ZIP_DIR = Path("./zip")
+os.makedirs(ZIP_DIR, exist_ok=True)
 
 # Mistral API key - should be moved to environment variable in production
 MISTRAL_API_KEY = "xinXihKFgx55WQJmuGp749rtwky4PSQU"  # Replace with your actual Mistral API key
@@ -86,6 +93,7 @@ class ProcessResponse(BaseModel):
     metadata: MetadataResponse
     tables: TablesResponse
     full_text_path: str
+    output_folder: str  # Path to the output folder containing all files
 
 # Helper function to format metadata for API response
 def format_metadata_for_api(pdf_path: str) -> MetadataResponse:
@@ -199,18 +207,38 @@ async def upload_file(background_tasks: BackgroundTasks, file: UploadFile = File
     if not file.filename.lower().endswith('.pdf'):
         raise HTTPException(status_code=400, detail="Only PDF files are supported")
 
-    # Save the uploaded file
-    temp_file_path = TEMP_DIR / file.filename
-    with open(temp_file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+    # Create a safe filename (remove special characters)
+    safe_filename = "".join([c for c in file.filename if c.isalnum() or c in "._- "]).strip()
+    if not safe_filename:
+        safe_filename = "uploaded_file.pdf"
+
+    # Ensure temp directory exists
+    os.makedirs(TEMP_DIR, exist_ok=True)
+
+    # Save the uploaded file with a safe filename
+    temp_file_path = TEMP_DIR / safe_filename
+
+    try:
+        with open(temp_file_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error saving uploaded file: {str(e)}")
 
     try:
         # Extract metadata
         metadata = format_metadata_for_api(temp_file_path)
 
+        # Create a safe folder name for output
+        safe_foldername = "".join([c for c in Path(safe_filename).stem if c.isalnum() or c in "._- "]).strip()
+        if not safe_foldername:
+            safe_foldername = f"output_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+        # Ensure output directory exists
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+
         # Create output directory for this file
-        file_output_dir = OUTPUT_DIR / Path(file.filename).stem
-        file_output_dir.mkdir(exist_ok=True)
+        file_output_dir = OUTPUT_DIR / safe_foldername
+        os.makedirs(file_output_dir, exist_ok=True)
 
         all_tables = []
         all_markdown = ""
@@ -286,21 +314,42 @@ async def upload_file(background_tasks: BackgroundTasks, file: UploadFile = File
 
                 # Save full text
                 text_file = file_output_dir / "full_text.txt"
-                with open(text_file, "w", encoding="utf-8") as f:
-                    f.write(all_markdown)
+                try:
+                    with open(text_file, "w", encoding="utf-8") as f:
+                        f.write(all_markdown)
+                except Exception as e:
+                    print(f"Error saving full text: {str(e)}")
+                    # Try an alternative location if there's an issue
+                    text_file = file_output_dir / "text.txt"
+                    with open(text_file, "w", encoding="utf-8") as f:
+                        f.write(all_markdown)
             except Exception as e:
                 # If OCR processing fails, log the error but continue with metadata
                 print(f"Error during OCR processing: {str(e)}")
                 all_markdown = f"OCR processing failed: {str(e)}"
                 text_file = file_output_dir / "error_log.txt"
-                with open(text_file, "w", encoding="utf-8") as f:
-                    f.write(all_markdown)
+                try:
+                    with open(text_file, "w", encoding="utf-8") as f:
+                        f.write(all_markdown)
+                except Exception as write_error:
+                    print(f"Error saving error log: {str(write_error)}")
+                    # Try an alternative location
+                    text_file = file_output_dir / "error.txt"
+                    with open(text_file, "w", encoding="utf-8") as f:
+                        f.write(all_markdown)
         else:
             # Mistral not available
             all_markdown = "OCR processing not available. Install mistralai package to enable this feature."
             text_file = file_output_dir / "info.txt"
-            with open(text_file, "w", encoding="utf-8") as f:
-                f.write(all_markdown)
+            try:
+                with open(text_file, "w", encoding="utf-8") as f:
+                    f.write(all_markdown)
+            except Exception as write_error:
+                print(f"Error saving info file: {str(write_error)}")
+                # Try an alternative location
+                text_file = file_output_dir / "info_note.txt"
+                with open(text_file, "w", encoding="utf-8") as f:
+                    f.write(all_markdown)
 
         # Schedule cleanup of temporary file
         background_tasks.add_task(os.remove, temp_file_path)
@@ -311,7 +360,8 @@ async def upload_file(background_tasks: BackgroundTasks, file: UploadFile = File
                 total_tables=len(table_info_list),
                 tables=table_info_list
             ),
-            full_text_path=str(text_file)
+            full_text_path=str(text_file),
+            output_folder=str(file_output_dir)
         )
 
     except Exception as e:
@@ -328,6 +378,154 @@ async def download_file(file_path: str):
         raise HTTPException(status_code=404, detail="File not found")
 
     return FileResponse(path=full_path, filename=full_path.name)
+
+@app.get("/download-output/{output_folder:path}")
+async def download_output_folder(output_folder: str, background_tasks: BackgroundTasks):
+    """
+    Download the entire output folder as a ZIP file
+
+    Args:
+        output_folder: Path to the output folder
+
+    Returns:
+        ZIP file containing all files in the output folder
+    """
+    full_path = Path(output_folder)
+
+    if not full_path.exists() or not full_path.is_dir():
+        raise HTTPException(status_code=404, detail="Output folder not found")
+
+    # Get the folder name for the ZIP file
+    folder_name = full_path.name
+
+    # Create a unique filename for the ZIP
+    timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    safe_folder_name = "".join([c for c in folder_name if c.isalnum() or c in "._- "]).strip()
+    if not safe_folder_name:
+        safe_folder_name = "output"
+
+    zip_filename = f"{safe_folder_name}_{timestamp}.zip"
+
+    # Ensure ZIP directory exists
+    os.makedirs(ZIP_DIR, exist_ok=True)
+    zip_path = ZIP_DIR / zip_filename
+
+    try:
+        # Create the ZIP file
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+            for file_path in full_path.rglob('*'):
+                if file_path.is_file():
+                    try:
+                        # Add the file to the ZIP with a relative path
+                        arcname = file_path.relative_to(full_path)
+                        zip_file.write(file_path, arcname=arcname)
+                    except Exception as e:
+                        print(f"Error adding file {file_path} to ZIP: {str(e)}")
+                        # Continue with other files
+                        continue
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error creating ZIP file: {str(e)}")
+
+    # Schedule cleanup of the ZIP file after it's been downloaded
+    background_tasks.add_task(lambda: os.remove(zip_path) if os.path.exists(zip_path) else None)
+
+    return FileResponse(
+        path=zip_path,
+        filename=zip_filename,
+        media_type="application/zip"
+    )
+
+class FilesRequest(BaseModel):
+    files: List[str]
+
+@app.post("/download-zip/")
+async def download_zip(background_tasks: BackgroundTasks, files_request: FilesRequest):
+    """
+    Create and download a ZIP file containing multiple files
+
+    Args:
+        files_request: Request body containing list of file paths to include in the ZIP
+
+    Returns:
+        StreamingResponse with the ZIP file
+    """
+    files = files_request.files
+    # Create a unique filename for the ZIP
+    timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    zip_filename = f"pdf_parser_results_{timestamp}.zip"
+
+    # Ensure ZIP directory exists
+    os.makedirs(ZIP_DIR, exist_ok=True)
+    zip_path = ZIP_DIR / zip_filename
+
+    try:
+        # Create the ZIP file
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+            for file_path in files:
+                try:
+                    full_path = Path(file_path)
+                    if full_path.exists():
+                        # Add the file to the ZIP with a relative path
+                        arcname = full_path.name
+                        zip_file.write(full_path, arcname=arcname)
+                except Exception as e:
+                    print(f"Error adding file {file_path} to ZIP: {str(e)}")
+                    # Continue with other files
+                    continue
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error creating ZIP file: {str(e)}")
+
+    # Schedule cleanup of the ZIP file after it's been downloaded
+    background_tasks.add_task(lambda: os.remove(zip_path) if os.path.exists(zip_path) else None)
+
+    return FileResponse(
+        path=zip_path,
+        filename=zip_filename,
+        media_type="application/zip"
+    )
+
+@app.post("/download-folder-zip/{folder_name}")
+async def download_folder_as_zip(folder_name: str, background_tasks: BackgroundTasks):
+    """
+    Create and download a ZIP file containing all files in a specific output folder
+
+    Args:
+        folder_name: Name of the folder to zip (relative to OUTPUT_DIR)
+
+    Returns:
+        StreamingResponse with the ZIP file
+    """
+    folder_path = OUTPUT_DIR / folder_name
+
+    if not folder_path.exists() or not folder_path.is_dir():
+        raise HTTPException(status_code=404, detail="Folder not found")
+
+    # Create a unique filename for the ZIP
+    zip_filename = f"{folder_name}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+    zip_path = ZIP_DIR / zip_filename
+
+    # Create the ZIP file in memory
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+        for file_path in folder_path.rglob('*'):
+            if file_path.is_file():
+                # Add the file to the ZIP with a relative path
+                arcname = file_path.relative_to(folder_path)
+                zip_file.write(file_path, arcname=arcname)
+
+    # Save the ZIP file
+    zip_buffer.seek(0)
+    with open(zip_path, 'wb') as f:
+        f.write(zip_buffer.getvalue())
+
+    # Schedule cleanup of the ZIP file after it's been downloaded
+    background_tasks.add_task(lambda: os.remove(zip_path) if os.path.exists(zip_path) else None)
+
+    return FileResponse(
+        path=zip_path,
+        filename=zip_filename,
+        media_type="application/zip"
+    )
 
 # Run the server if executed as a script
 if __name__ == "__main__":

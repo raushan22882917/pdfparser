@@ -140,6 +140,45 @@ Note: If Mistral AI is not installed or OCR processing fails, the response will 
 **Response**:
 - The file as a download
 
+#### 3. Download Output Folder as ZIP
+
+**Endpoint**: `GET /download-output/{output_folder}`
+
+**Request**:
+- `output_folder`: Path to the output folder to download as ZIP (returned in the upload response as `output_folder`)
+
+**Response**:
+- ZIP file containing all files in the specified output folder
+
+#### 4. Download Folder as ZIP (Alternative)
+
+**Endpoint**: `POST /download-folder-zip/{folder_name}`
+
+**Request**:
+- `folder_name`: Name of the folder to download as ZIP (usually the PDF filename without extension)
+
+**Response**:
+- ZIP file containing all files in the specified folder
+
+#### 5. Download Multiple Files as ZIP
+
+**Endpoint**: `POST /download-zip/`
+
+**Request**:
+- JSON body with a list of file paths to include in the ZIP:
+```json
+{
+  "files": [
+    "output/example/table_1.csv",
+    "output/example/table_2.xlsx",
+    "output/example/full_text.txt"
+  ]
+}
+```
+
+**Response**:
+- ZIP file containing all the specified files
+
 ### Interactive API Documentation
 
 FastAPI provides automatic interactive API documentation:
